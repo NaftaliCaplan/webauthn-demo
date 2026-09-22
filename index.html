@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WebAuthn Demo</title>
+<style>
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* otherwise .welcome's display:flex beats the hidden attribute */
+  body { margin: 0; font-family: system-ui, sans-serif; background: #f3f4f8; color: #1f2330; }
+  header { background: #1f2330; color: #fff; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 18px; margin: 0; }
+  main { max-width: 860px; margin: 24px auto; padding: 0 16px; }
+  .card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px #0001; margin-bottom: 16px; }
+  .status { display: flex; align-items: center; gap: 10px; }
+  .pill { padding: 6px 12px; border-radius: 999px; font-weight: 600; font-size: 14px; }
+  .pill.in { background: #16a34a; } .pill.out { background: #6b7280; }
+  input { padding: 10px 12px; font-size: 15px; border: 1px solid #ccd; border-radius: 8px; width: 240px; }
+  button { padding: 10px 18px; font-size: 15px; border: 0; border-radius: 8px; cursor: pointer; color: #fff; background: #4f46e5; }
+  button.secondary { background: #059669; } button.ghost { background: #ffffff22; padding: 6px 12px; font-size: 14px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  header.in { background: #15803d; transition: background .3s; }
+  .welcome { display: flex; align-items: center; gap: 18px; background: #ecfdf5; border: 2px solid #16a34a; }
+  .welcome h2 { margin: 0 0 4px; color: #166534; }
+  .avatar { width: 64px; height: 64px; border-radius: 50%; background: #16a34a; color: #fff; font-size: 30px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
+  .welcome button { margin-left: auto; background: #dc2626; }
+  .chip { display: inline-block; padding: 4px 10px; margin: 3px; border-radius: 999px; background: #eef; font-size: 13px; cursor: pointer; }
+  .chip.me { background: #16a34a; color: #fff; }
+  .chip .x { margin-left: 6px; opacity: .5; font-weight: 700; } .chip .x:hover { opacity: 1; color: #dc2626; }
+  .step { display: grid; grid-template-columns: 36px 1fr; gap: 12px; }
+  .num { width: 32px; height: 32px; border-radius: 50%; background: #4f46e5; color: #fff; display: grid; place-items: center; font-weight: 700; }
+  .step.err .num { background: #dc2626; } .step.ok .num { background: #16a34a; }
+  .dir { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #4f46e5; }
+  .step h3 { margin: 2px 0 6px; font-size: 16px; font-family: ui-monospace, monospace; }
+  .step p { margin: 0 0 8px; line-height: 1.45; color: #444; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; font-size: 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin: 0; }
+  ul.checks { list-style: none; padding: 0; margin: 0; } ul.checks li { padding: 3px 0; }
+  .muted { color: #777; }
+  .hint { background: #fff7ed; border: 1px solid #fdba74; border-radius: 8px; padding: 10px 12px; margin: 10px 0; color: #7c2d12; line-height: 1.45; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔑 WebAuthn / Passkey Demo</h1>
+  <div class="status" id="status"></div>
+</header>
+<main>
+  <div class="card welcome" id="welcome" hidden></div>
+  <div class="card" id="form">
+    <input id="username" placeholder="username" autofocus>
+    <button id="regBtn" onclick="run('register')">Register</button>
+    <button id="loginBtn" class="secondary" onclick="run('login')">Login</button>
+    <button id="pickBtn" class="secondary" onclick="run('login', true)" title="Usernameless login: Windows shows every passkey for this site and you pick one">Login with passkey picker</button>
+    <p class="muted" style="margin:10px 0 0">Register creates a passkey for the username. Login proves you hold it. Each step of the protocol shows up below.</p>
+  </div>
+  <div class="card" id="accounts"></div>
+  <div id="log"></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// Shown when the passkey prompt fails. The browser reports cancel, timeout, and provider failure all as
+// NotAllowedError, so we can't tell them apart. We explain the likely cause instead.
+const PROVIDER_HINT = `<div class="hint">The browser reports cancelling, timing out, and authenticator errors all as
+  <code>NotAllowedError</code>, so the page can't tell which happened. If you pressed Cancel or waited too long, just try again.<br>
+  <b>Registering in Edge?</b> If Windows says <b>"Something went wrong"</b> after your PIN, click
+  <b>"Choose a different passkey"</b> (or Try again) and enter your PIN again. Microsoft Password Manager fails its first
+  attempt when the request goes through Windows.</div>`;
+const show = d => typeof d === "string" ? d : JSON.stringify(d, null, 2);
+
+// Explanatory text for each step of both ceremonies
+const TEXT = {
+  register: {
+    start: "The user wants a passkey. The browser asks the <b>Relying Party</b> (RP, our Flask server) to begin registration for this username.",
+    options: "The server makes a random <b>challenge</b> and saves it in the session. It sends back its identity (<code>rp</code>), the user (<code>user.id</code> is the <i>user handle</i>), the key algorithms it accepts (<code>pubKeyCredParams</code>: -8 = EdDSA, -7 = ES256, -257 = RS256), and its attestation preference.",
+    call: "The browser hands the options to an <b>authenticator</b> (Windows Hello, a phone, a security key). The browser adds the page's <b>origin</b>, which is why a passkey made for <code>localhost</code> can never be phished by another site. <div class='hint'>Tip: if Windows says \"Something went wrong\" after your PIN, click <b>Choose a different passkey</b>, pick the same one, and enter your PIN again (Microsoft Password Manager bug).</div>",
+    cred: "The authenticator checks it's you (PIN or biometric), makes a <b>new key pair for this site only</b>, keeps the private key, and returns the public key inside <code>attestationObject</code>, along with <code>clientDataJSON</code> (what the browser saw). Binary fields are base64url-encoded.",
+    post: "The browser sends the whole credential (the JSON from step 4) back to the server.",
+    decoded: "<code>clientDataJSON</code> is plain JSON. <code>attestationObject</code> is CBOR holding the <b>authenticator data</b>: SHA-256 of the RP ID, flags (UP = user present, UV = user verified, BE/BS = backup eligible/state, AT = credential data attached), a signature counter, and the new <b>credential ID + public key</b> (COSE format).",
+    checks: "The server checks the response against what it expected:",
+    done: "The server saves the credential ID, public key, and sign count in SQLite. <b>No password or secret is stored, only a public key.</b> You can log in now.",
+  },
+  login: {
+    start: "The user wants to log in. The browser asks the server to start an authentication ceremony for this username.",
+    pick: "<b>Usernameless login.</b> No username is sent. The server returns an <b>empty</b> <code>allowCredentials</code>, so the authenticator shows every passkey it holds for <code>localhost</code> and you pick one. The server then works out who you are from the credential ID (and <code>userHandle</code>) in the response. This only works because the passkeys are <i>discoverable</i> (stored on the authenticator together with the user info).",
+    options: "The server checks the user exists and sends a <b>new random challenge</b> (saved in the session). <code>allowCredentials</code> is deliberately <b>empty</b>: normally the server would list this user's credential IDs there, but in Edge that sends the request through Windows into Microsoft Password Manager, where the first attempt always fails. With an empty list, Edge shows its own passkey picker instead. The server checks afterwards that the passkey you picked belongs to this user.",
+    call: "The browser asks the authenticator for an assertion. Only a credential made for this origin's RP ID can answer. Since <code>allowCredentials</code> is empty, you'll see a list of your passkeys for this site: pick the one for this username.",
+    cred: "The authenticator finds the matching private key, checks it's you, and <b>signs authenticatorData ‖ SHA-256(clientDataJSON)</b>. The challenge sits inside clientDataJSON, so the signature only works for <i>this</i> login attempt, and replaying an old one fails.",
+    post: "The browser sends the assertion (the JSON from step 4) to the server.",
+    decoded: "The server decodes clientDataJSON and the authenticator data (RP ID hash, flags, counter). <code>signature</code> is what gets checked, and <code>userHandle</code> is the user.id set at registration.",
+    checks: "The server checks everything, then verifies the signature with the public key stored at registration:",
+    done: "Signature valid → the server sets <code>session['user']</code>. <b>You are now logged in.</b> The sign count is updated so a cloned authenticator can be detected.",
+  },
+};
+
+let steps = [];  // the walkthrough for the current ceremony (starts fresh on every page load)
+function render() {
+  $("log").innerHTML = steps.map((s, i) => `<div class="card step ${s.cls}"><div class="num">${i + 1}</div><div>
+    <div class="dir">${s.dir}</div><h3>${esc(s.title)}</h3><p>${s.text}</p>
+    ${s.data === undefined ? "" : `<pre>${esc(show(s.data))}</pre>`}</div></div>`).join("");
+}
+function step(dir, title, text, data, cls = "") {
+  steps.push({ dir, title, text, data, cls });
+  render();
+}
+function clearSteps() { steps = []; render(); }
+
+let t0 = null;  // when the authenticator prompt started (used to report how fast a failure happened)
+async function run(kind, pick = false) {  // pick = usernameless login (no allowCredentials)
+  const user = pick ? "" : $("username").value.trim();
+  if (!pick && !user) return $("username").focus();
+  const T = TEXT[kind], reg = kind === "register";
+  // Lock the buttons so a double click can't start a second ceremony and replace the session challenge
+  $("regBtn").disabled = $("loginBtn").disabled = $("pickBtn").disabled = true;
+  clearSteps();
+  try {
+    step("Browser → Server", pick ? "GET /login  (no username)" : `GET /${kind}?username=${user}`, pick ? T.pick : T.start);
+    const res = await fetch(pick ? "/login" : `/${kind}?username=${encodeURIComponent(user)}`)
+      .catch(() => { throw new Error("Could not reach the server. Is `python app.py` running?"); });
+    const opts = await res.json();
+    if (!res.ok) throw new Error(opts.error);
+    step("Server → Browser", reg ? "PublicKeyCredentialCreationOptions" : "PublicKeyCredentialRequestOptions", T.options, opts);
+
+    const call = reg ? "navigator.credentials.create" : "navigator.credentials.get";
+    const parse = reg ? PublicKeyCredential.parseCreationOptionsFromJSON : PublicKeyCredential.parseRequestOptionsFromJSON;
+    step("Browser → Authenticator", `${call}()`, T.call,
+      `const options = PublicKeyCredential.${parse.name}(json);\nconst credential = await ${call}({ publicKey: options });`);
+    t0 = performance.now();
+    const cred = (await navigator.credentials[reg ? "create" : "get"]({ publicKey: parse(opts) })).toJSON();
+    t0 = null;
+    step("Authenticator → Browser", reg ? "PublicKeyCredential (attestation)" : "PublicKeyCredential (assertion)", T.cred, cred);
+
+    step("Browser → Server", `POST /${kind}`, T.post, `POST /${kind} HTTP/1.1\nContent-Type: application/json\n\n{ ...credential from step 4... }`);
+    const r = await fetch(`/${kind}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cred) });
+    const result = await r.json();
+    if (result.decoded) step("Server", "Decode the response", T.decoded, result.decoded);
+    if (result.checks) step("Server", "Verify", T.checks + "<ul class='checks'>" +
+      result.checks.map(([c, ok]) => `<li>${ok ? "✅" : "❌"} ${esc(c)}</li>`).join("") + "</ul>", undefined, result.ok ? "ok" : "err");
+    if (result.unknown && await forget(cred.id))
+      result.error += ". The site told your browser to forget this leftover passkey (PublicKeyCredential.signalUnknownCredential)";
+    if (!result.ok) throw new Error(result.error);
+    step("Server → Browser", reg ? "Registered ✔ (row saved to SQLite)" : `Logged in as ${result.user} ✔`, T.done,
+      reg ? { stored: result.stored, ...result.info } : result.info, "ok");
+  } catch (e) {
+    const denied = e.name === "NotAllowedError";
+    step("Error", denied ? "Passkey prompt failed" : e.name === "InvalidStateError"
+      ? "Authenticator already has a passkey for this user" : "Failed",
+      `<b>${esc(e.name)}</b>: ${esc(e.message)}` + (t0 ? ` <span class="muted">(authenticator gave up after ${((performance.now() - t0) / 1000).toFixed(1)}s)</span>` : "") +
+      (denied ? PROVIDER_HINT + `<button data-kind="${kind}" data-user="${esc(user)}" data-pick="${pick}" onclick="retry(this)">↻ Try again</button>` : ""),
+      undefined, "err");
+    t0 = null;
+  } finally {
+    refresh();
+  }
+}
+
+// WebAuthn Signal API: tell the passkey provider a credential no longer exists on the server, so it can remove it.
+// Supported in recent Chromium browsers, and the provider decides what to do. Returns false where unsupported.
+async function forget(credentialId) {
+  if (!PublicKeyCredential.signalUnknownCredential) return false;
+  try { await PublicKeyCredential.signalUnknownCredential({ rpId: location.hostname, credentialId }); return true; }
+  catch { return false; }
+}
+
+async function del(ev, username) {
+  ev.stopPropagation();
+  if (!confirm(`Delete account "${username}" from the database?`)) return;
+  const { deleted } = await (await fetch(`/users/${encodeURIComponent(username)}`, { method: "DELETE" })).json();
+  const told = (await Promise.all(deleted.map(forget))).some(Boolean);
+  step("Browser → Server", `DELETE /users/${username}`, `The server deleted ${deleted.length} credential(s) for <b>${esc(username)}</b> from SQLite. ` +
+    (told ? "The page also called <code>PublicKeyCredential.signalUnknownCredential()</code> so your passkey provider can remove the matching passkey."
+          : "This browser doesn't support the WebAuthn Signal API, so the passkey stays on your device. Delete it yourself in your passkey settings."),
+    deleted, "ok");
+  refresh();
+}
+
+function retry(btn) {
+  $("username").value = btn.dataset.user;
+  run(btn.dataset.kind, btn.dataset.pick === "true");
+}
+
+async function logout() {
+  await fetch("/logout", { method: "POST" });
+  step("Browser → Server", "POST /logout", "The server deletes <code>user</code> from the session. The passkey stays registered, so you can log in again at any time.", undefined, "ok");
+  refresh();
+}
+
+async function refresh() {
+  const [{ user, since }, users] = await Promise.all([fetch("/me").then(r => r.json()), fetch("/users").then(r => r.json())]);
+  document.querySelector("header").classList.toggle("in", !!user);
+  // Logged in: hide the register/login form entirely, so it's obvious you must log out first
+  $("form").hidden = !!user;
+  $("regBtn").disabled = $("loginBtn").disabled = $("pickBtn").disabled = false;
+  $("accounts").innerHTML = `<b>Registered accounts</b> <span class="muted">(saved in webauthn.db, ${users.length} total${user ? "" : ", click one to fill the username"})</span><br>` +
+    (users.map(u => `<span class="chip ${u.username === user ? "me" : ""}" data-user="${esc(u.username)}" onclick="$('username').value=this.dataset.user">${esc(u.username)}<span class="x" title="Delete this account" onclick="del(event, this.parentElement.dataset.user)">×</span></span>`).join("") || `<span class="muted">none yet, register one above</span>`);
+  $("status").innerHTML = user
+    ? `<span class="pill in">● Logged in as ${esc(user)}</span><button class="ghost" onclick="logout()">Log out</button>`
+    : `<span class="pill out">○ Not logged in</span>`;
+  $("welcome").hidden = !user;
+  if (user) $("welcome").innerHTML = `<div class="avatar">${esc(user[0].toUpperCase())}</div>
+    <div><h2>✅ You are logged in as ${esc(user)}</h2>
+    <span class="muted">Logged in with a passkey at ${since}. Your session cookie says <code>user = "${esc(user)}"</code>.<br>
+    Log out to log in as someone else or register a new user.</span></div>
+    <button onclick="logout()">Log out</button>`;
+}
+// Every page load is a fresh demo: log out of any previous session (registered accounts stay in SQLite)
+localStorage.removeItem("walkthrough");  // clean up the walkthrough older versions of this page saved
+fetch("/logout", { method: "POST" }).then(refresh);
+</script>
+</body>
+</html>
