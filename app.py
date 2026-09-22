@@ -12,7 +12,7 @@ from webauthn.helpers.structs import AuthenticatorSelectionCriteria, ResidentKey
 RP_ID, RP_NAME, ORIGIN = "localhost", "WebAuthn Demo", "http://localhost:5000"
 
 app = Flask(__name__)
-app.secret_key = "cy2550-demo-key"  # fixed so logins survive server restarts (fine for a demo, never in production)
+app.secret_key = os.urandom(32)  # random per run: the page logs out on every load anyway
 
 def db():
     conn = sqlite3.connect(os.path.join(app.root_path, "webauthn.db"))  # next to app.py, whatever the working dir
